@@ -1,0 +1,262 @@
+#import thư viện chuẩn
+import argparse
+import socket
+import threading
+from pathlib import Path
+#import thư viện hỗ trợ giao diện
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+#import module của dự án
+from .config import Config
+from .connection_manager import ConnectionManager, PeerConnection
+from .chat_manager import ChatManager
+from .discovery import DiscoveryService
+from .peer_manager import PeerManager
+from .protocol import send_frame
+from .tcp_server import TCPServer
+# Hàm xác định địa chỉ IPv4 của máy khi ra mạng
+def detect_local_ip() -> str:
+    """Tìm địa chỉ IPv4 nguồn dùng cho route mặc định mà không cần gửi dữ liệu."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # IPv4 UDP
+    try:
+        probe.connect(("8.8.8.8", 80)) # kết nối với public dns của google
+        return probe.getsockname()[0] # getsockname(): (IP, port) -> getsockname()[0]: IP
+    except OSError:
+        return "127.0.0.1" # loopback
+    finally:
+        probe.close()
+# tạo lớp quản lí chính, giao tiếp với user
+class LANChatApp:
+    def __init__(self, config: Config):
+        config.validate()
+        self.config = config
+        self.local_ip = detect_local_ip()
+        self.peers = PeerManager()
+        self.connections = ConnectionManager()
+        self.chats = ChatManager()
+        self.current_peer_key = None
+        self._screen_lock = threading.Lock()
+        self._stop = threading.Event()
+        self.discovery = DiscoveryService(config, self.peers, self.local_ip, self._on_peer_event, self.say)
+        self.tcp_server = TCPServer(config, self.local_ip, self.connections, self._on_message, self._on_connection_closed, self.say)
+    # hàm in ra tin nhắn ngay lập tức
+    def say(self, message: str):
+        with self._screen_lock:
+            print(message, flush= True)
+    # hàm khởi chạy app
+    def start(self):
+        Path(self.config.download_dir).mkdir(parents= True, exist_ok= True)
+        self.tcp_server.start()
+        self.discovery.start()
+        self.say("")
+        self.say(f"P2P LAN Messenger started as {self.config.username}")
+        self.say(f"Local address: {self.local_ip}:{self.config.tcp_port}")
+        self.say("Type /help to see commands.")
+    # hàm chạy chương trình chính
+    def run(self):
+        self.start()
+        session = PromptSession()
+        try:
+            with patch_stdout(): # vẽ lại input đang nhập
+                while not self._stop.is_set():
+                    try:
+                        line = session.prompt("> ")
+                    except (EOFError, KeyboardInterrupt):
+                        self.quit()
+                        break
+                    self._handle_input(line.strip()) # giao việc cho _handle_input xử lí
+        finally:
+            self.shutdown() # giao việc cho shutdown xử lí
+    #hàm xử lí callback _on_peer_event
+    def _on_peer_event(self, event, peer):
+        """Cập nhật mỗi khi dùng /list, để tránh bị in lại nhiều lần mỗi khi nhận HELLO."""
+        if event == "online":
+            self.say(f"[*] {peer['name']} is online ({peer['ip']}:{peer['tcp_port']})")
+        elif event == "offline":
+            self.say(f"[-] {peer['name']} is offline")
+    # hàm xử lí callback _on_message
+    def _on_message(self, connection: PeerConnection, message: str):
+        key = connection.key
+        self.chats.add(key, "in", message, unread= (key != self.current_peer_key)) # thêm lịch sử trò chuyện
+        if key == self.current_peer_key: # tin nhắn từ người đang chat chung
+            self.say(f"[{connection.peer['name']}] {message}")
+        else: # tin nhắn đến từ người khác
+            count = self.chats.unread_count(key)
+            self.say(f"[*] New message from {connection.peer['name']} ({count} unread)")
+    # hàm xử lí callback _on_connection_closed
+    def _on_connection_closed(self, connection, reason, already_closing):
+        removed = self.connections.remove(connection)
+        if removed:
+            if self.current_peer_key == connection.key:
+                self.current_peer_key = None # peer rời chat
+            if not already_closing: # đã đóng chat
+                self.say(f"[*] Chat with {connection.peer['name']} closed: {reason}")
+    # hàm xử lí callback _connect_to_peer
+    def _connect_to_peer(self, peer):
+        key = (peer["ip"], peer["tcp_port"])
+        existing = self.connections.get(key)
+        if existing: # kiểm xem peer đã có connect chưa
+            return existing
+        sock = socket.create_connection((peer["ip"], peer["tcp_port"]), timeout= 8)
+        sock.settimeout(None)
+        peer_id = f"{self.local_ip}:{self.config.tcp_port}"
+        send_frame(sock, {
+            "type": "HI",
+            "kind": "chat",
+            "name": self.config.username,
+            "port": self.config.tcp_port,
+            "peer_id": peer_id,
+        })
+        connection = PeerConnection(sock, peer, peer_id, self._on_message, self._on_connection_closed)
+        if self.connections.register(connection): # đã đăng kí thì chat
+            connection.start()
+            self.say(f"[*] Connected to {peer['name']}")
+            return connection
+        return self.connections.get(key) # trả lại này nếu đã có connect rồi, đăng kí rồi
+    # hàm xử lí input
+    def _handle_input(self, line: str):
+        if not line:
+            return
+        if line.startswith("/"):
+            self._handle_command(line) # bàn giao việc cho _handle_command nếu input bắt đầu bằng '/'
+            return
+        if self.current_peer_key is None:
+            self.say("[!] Open a chat first with /chat <name|number>.")
+            return
+        connection = self.connections.get(self.current_peer_key)
+        if not connection:
+            self.say("[!] Current chat is no longer connected.")
+            self.current_peer_key = None
+            return
+        try:
+            connection.send_message(line)
+            self.chats.add(connection.key, "out", line)
+        except (OSError) as exc:
+            self.say(f"[!] Could not send message: {exc}")
+    # hàm xử lí command
+    def _handle_command(self, line: str):
+        parts = line.split(maxsplit= 1)
+        command = parts[0].lower()
+        argument = parts[1].strip() if len(parts) > 1 else ""
+        if command == "/help":
+            self.say(
+                "Commands:\n"
+                "  /list                 List discovered peers\n"
+                "  /chat <name|number>   Connect to a peer / switch chat\n"
+                "  /leave                Close the current chat\n"
+                "  /send <file-path>     Send a file to the current peer\n"
+                "  /status online|away   Change presence status\n"
+                "  /help                 Show this help\n"
+                "  /quit                 Exit"
+            )
+        elif command == "/list":
+            self._list_peers() # giao việc cho _list_peers
+        elif command == "/chat":
+            self._chat(argument) # giao việc cho _chat
+        elif command == "/leave":
+            self._leave() # giao việc cho _leave
+        elif command == "/send":
+            self._send_file(argument) # giao việc cho _send_file
+        elif command == "/status":
+            self._set_status(argument) # giao việc cho _set_status
+        elif command == "/quit":
+            self.quit() # giao việc cho quit
+        else:
+            self.say("[!] Unknown command. Type /help.")
+    def _list_peers(self):
+        peers = sorted(self.peers.snapshot(), key= lambda p: (p["name"].casefold(), p["ip"]))
+        if not peers:
+            self.say("[*] No peers discovered yet.")
+            return
+        self.say("Online peers:")
+        for index, peer in enumerate(peers, 1):
+            connected = "connected" if self.connections.get((peer["ip"], peer["tcp_port"])) else "not connected"
+            self.say(
+                f"  {index}. {peer['name']:<16} {peer['ip']}:{peer['tcp_port']} "
+                f"{peer['status']:<7} [{connected}]"
+            )
+    def _chat(self, query):
+        if not query: # chưa nhập tên ng muốn chat
+            self.say("Usage: /chat <name|number>")
+            return
+        peer = self.peers.find(query)
+        if not peer: # kiếm ko thấy người muốn chat
+            self.say("[!] Peer not found or name is ambiguous. Use /list and select its number.")
+            return
+        try:
+            connection = self._connect_to_peer(peer)
+            if connection is None:
+                self.say("[!] Could not establish chat connection.")
+                return
+            self.current_peer_key = connection.key
+            unread = self.chats.clear_unread(connection.key)
+            self.say(f"[*] Chatting with {peer['name']}. {unread} unread message(s).")
+            for direction, message in self.chats.history(connection.key):
+                label = self.config.username if direction == "out" else peer["name"]
+                self.say(f"[{label}] {message}")
+        except (OSError, ValueError) as exc:
+            self.say(f"[!] Could not connect to {peer['name']}: {exc}")
+    def _leave(self):
+        if self.current_peer_key is None:
+            self.say("[*] No active chat.")
+            return
+        connection = self.connections.get(self.current_peer_key)
+        self.current_peer_key = None
+        if connection:
+            connection.close(send_bye= True)
+            self.connections.remove(connection)
+            self.say(f"[*] Left chat with {connection.peer['name']}.")
+    def _send_file(self, argument):
+        if not argument:
+            self.say("Usage: /send <file-path>")
+            return
+        if self.current_peer_key is None:
+            self.say("[!] Open a chat first.")
+            return
+        connection = self.connections.get(self.current_peer_key)
+        if not connection:
+            self.say("[!] Current peer is disconnected.")
+            return
+        peer = connection.peer
+        from .file_transfer import FileTransfer
+        FileTransfer(self.config, self.local_ip, self.say).send(peer, argument)
+    def _set_status(self, status):
+        if status not in ("online", "away"):
+            self.say("Usage: /status online|away")
+            return
+        self.discovery.set_status(status)
+        self.say(f"[*] Status changed to {status}.")
+    def quit(self):
+        self._stop.set()
+    def shutdown(self):
+        self._stop.set()
+        self.discovery.stop()
+        self.tcp_server.stop()
+        self.connections.close_all()
+        self.say("[*] LAN Chat stopped.")
+def main():
+    parser = argparse.ArgumentParser(description="LAN peer-to-peer chat and file sharing.")
+    parser.add_argument("--name", required=True, help="Your display name on the LAN.")
+    parser.add_argument("--tcp-port", type=int, default=5000, help="TCP listening port (default: 5000).")
+    parser.add_argument("--udp-port", type=int, default=9999, help="UDP discovery port (default: 9999).")
+    parser.add_argument("--broadcast", default="255.255.255.255", help="IPv4 broadcast address.")
+    parser.add_argument("--downloads", default="downloads", help="Directory for received files.")
+    args = parser.parse_args()
+
+    config = Config(
+        username=args.name,
+        tcp_port=args.tcp_port,
+        udp_port=args.udp_port,
+        broadcast_ip=args.broadcast,
+        download_dir=args.downloads,
+    )
+    try:
+        LANChatApp(config).run()
+    except OSError as exc:
+        raise SystemExit(f"Startup failed: {exc}")
+
+
+
+
+            
+        
