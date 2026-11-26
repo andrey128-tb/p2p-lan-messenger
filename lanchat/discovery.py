@@ -83,7 +83,7 @@ class DiscoveryService:
                 return None
             if status not in ("online", "away"):
                 return None
-            if not 1 <= port <= 65535:
+            if not 1024 <= port <= 49151:
                 return None
             return name, port, status
         except ValueError:
