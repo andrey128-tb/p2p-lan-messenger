@@ -64,7 +64,10 @@ class LANChatApp:
                     except (EOFError, KeyboardInterrupt):
                         self.quit()
                         break
-                    self._handle_input(line.strip()) # giao việc cho _handle_input xử lí
+                    try:
+                        self._handle_input(line.strip()) # giao việc cho _handle_input xử lí
+                    except Exception as exc:
+                        self.say(f"[!] Internal error: {exc!r}") # !r: in kèm thêm ''
         finally:
             self.shutdown() # giao việc cho shutdown xử lí
     #hàm xử lí callback _on_peer_event
@@ -252,7 +255,7 @@ def main():
     )
     try:
         LANChatApp(config).run()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise SystemExit(f"Startup failed: {exc}")
 
 

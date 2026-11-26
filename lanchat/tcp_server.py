@@ -62,6 +62,7 @@ class TCPServer:
     # hàm xử lí kết nối mới
     def _handle_new_connection(self, sock, addr):
         """Handle new connection."""
+        handed_off = False
         try:
             sock.settimeout(8.0)
             hello = recv_frame(sock, self.config.max_control_frame) # nhận 1 frame
@@ -80,7 +81,7 @@ class TCPServer:
             if not 1 <= port <= 65535:
                 raise ValueError("Invalid peer TCP port.")
             if kind == "file":
-                sock.settimeout(None) # không giới hạn thời gian
+                sock.settimeout(300.0) # sau 5p không nhận được dữ liệu thì dừng
                 self.file_transfer.handle_incoming(sock, peer) # bàn giao socket cho FileTransfer xử lí
                 return
             if kind != "chat":
@@ -88,12 +89,15 @@ class TCPServer:
             sock.settimeout(None) # tắt cho chat
             connection = PeerConnection(sock, peer, peer["peer_id"], self.on_message, self.on_closed) # bàn giao quản lí kết nối chat cho PeerConnection
             if self.connections.register(connection): # nếu đã đăng kí thì chat
+                handed_off = True
                 self.print(f"[*] Chat connection from {name} ({addr[0]}:{port})")
                 connection.start()
-        except (OSError, ValueError) as exc: # bị lỗi thì thông báo và thử đóng socket
+        except (OSError, ValueError, TypeError) as exc: # bị lỗi thì thông báo và thử đóng socket
             self.print(f"[TCP] Rejected connection from {addr}: {exc}")
-            try:
-                sock.close()
-            except OSError:
-                pass
+        finally:
+            if not handed_off:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 

@@ -43,7 +43,7 @@ class PeerManager:
             p["ip"], # ưu tiên 2: sort theo ip
             p["tcp_port"] # ưu tiên 3: sort theo tcp port
         ))
-        if query.isdigit(): # nếu chuỗi là số (tìm theo id)
+        if query.isascii() and query.isdecimal(): # nếu chuỗi là số (tìm theo id)
             index = int(query) - 1
             return peers[index] if 0 <= index < len(peers) else None
         matches = [p for p in peers if p["name"].casefold() == query.casefold()] # tìm các tên tương ứng với query
